@@ -869,3 +869,36 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+
+####################################################################################
+
+
+
+
+class Concat_bifpn(nn.Module):
+    # Concatenate a list of tensors along dimension
+    def __init__(self, c1, c2):
+        super(Concat_bifpn, self).__init__()
+        self.w1_weight = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        self.w2_weight = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
+       # self.w3 = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
+        self.epsilon = 0.0001
+        self.conv = Conv(c1, c2, 1 ,1 ,0 )
+        self.act= nn.ReLU()
+
+    def forward(self, x): # mutil-layer 1-3 layers #ADD or Concat 
+        #print("bifpn:",x.shape)
+        if len(x) == 2:
+            w = self.w1_weight
+            weight = w / (torch.sum(w, dim=0) + self.epsilon)
+            x = self.conv(self.act(weight[0] * x[0] + weight[1] * x[1]))
+        elif len(x) == 3: 
+            w = self.w2_weight
+            weight = w / (torch.sum(w, dim=0) + self.epsilon)
+            x = self.conv(self.act (weight[0] * x[0] + weight[1] * x[1] + weight[2] * x[2]))
+        # elif len(x) == 4:    
+        #     w = self.w3
+        #     weight = w / (torch.sum(w, dim=0) + self.epsilon)
+        #     x = self.conv(self.act(weight[0] * x[0] + weight[1] * x[1] + weight[2] *x[2] + weight[3]*x[3] ))
+        return x 
