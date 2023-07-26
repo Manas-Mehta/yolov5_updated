@@ -902,3 +902,55 @@ class Concat_bifpn(nn.Module):
         #     weight = w / (torch.sum(w, dim=0) + self.epsilon)
         #     x = self.conv(self.act(weight[0] * x[0] + weight[1] * x[1] + weight[2] *x[2] + weight[3]*x[3] ))
         return x 
+
+class ASFFV5(nn.Module):
+    def __init__(self, level, multiplier=1, rfb=False, vis=False, act_cfg=True):
+        """
+        ASFF version for YoloV5 .
+        different than YoloV3
+        multiplier should be 1, 0.5
+        which means, the channel of ASFF can be 
+        512, 256, 128 -> multiplier=1
+        256, 128, 64 -> multiplier=0.5
+        For even smaller, you need change code manually.
+        """
+        super(ASFFV5, self).__init__()
+        self.level = level
+        self.dim = [int(1024*multiplier), int(512*multiplier),
+                    int(256*multiplier)]
+        # print(self.dim)
+        
+        self.inter_dim = self.dim[self.level]
+        if level == 0:
+            self.stride_level_1 = Conv(int(512*multiplier), self.inter_dim, 3, 2)
+                
+            self.stride_level_2 = Conv(int(256*multiplier), self.inter_dim, 3, 2)
+                
+            self.expand = Conv(self.inter_dim, int(
+                1024*multiplier), 3, 1)
+        elif level == 1:
+            self.compress_level_0 = Conv(
+                int(1024*multiplier), self.inter_dim, 1, 1)
+            self.stride_level_2 = Conv(
+                int(256*multiplier), self.inter_dim, 3, 2)
+            self.expand = Conv(self.inter_dim, int(512*multiplier), 3, 1)
+        elif level == 2:
+            self.compress_level_0 = Conv(
+                int(1024*multiplier), self.inter_dim, 1, 1)
+            self.compress_level_1 = Conv(
+                int(512*multiplier), self.inter_dim, 1, 1)
+            self.expand = Conv(self.inter_dim, int(
+                256*multiplier), 3, 1)
+
+        # when adding rfb, we use half number of channels to save memory
+        compress_c = 8 if rfb else 16
+        self.weight_level_0 = Conv(
+            self.inter_dim, compress_c, 1, 1)
+        self.weight_level_1 = Conv(
+            self.inter_dim, compress_c, 1, 1)
+        self.weight_level_2 = Conv(
+            self.inter_dim, compress_c, 1, 1)
+
+        self.weight_levels = Conv(
+            compress_c*3, 3, 1, 1)
+        self.vis = vis
