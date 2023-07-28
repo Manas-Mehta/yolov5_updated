@@ -27,7 +27,7 @@ from utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suff
                            is_jupyter,make_divisible,non_max_suppression,scale_boxes, xywh2xyxy, xyxy2xywh,yaml_load)
 from utils.plots import Annotator, colors,save_one_box
 from utils.torch_utils import copy_attr,smart_inference_mode
-from .transformer import DeformableTransformerDecoder, DeformableTransformerDecoderLayer,bias_init_with_prob, linear_init_
+#from .transformer import DeformableTransformerDecoder, DeformableTransformerDecoderLayer,bias_init_with_prob, linear_init_
 
 import ast
 import contextlib
