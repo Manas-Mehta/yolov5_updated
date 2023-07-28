@@ -174,4 +174,4 @@ def attempt_download_asset(file, repo='ultralytics/assets', release='v0.0.0'):
         if name in assets:
             safe_download(url=f'https://github.com/{repo}/releases/download/{tag}/{name}', file=file, min_bytes=1E5)
 
-        return str(file
+        return str(file)
