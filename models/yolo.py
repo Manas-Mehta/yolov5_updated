@@ -1,17 +1,41 @@
-# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
-"""
-YOLO-specific modules
+"""YOLOv5-specific modules
 
 Usage:
-    $ python models/yolo.py --cfg yolov5s.yaml
+    $ python path/to/models/yolo.py --cfg yolov5s.yaml
 """
 
+
+import contextlib
+import platform
+import threading
+import contextlib
+import inspect
+import logging.config
+import os
+import platform
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import uuid
+import urllib
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Union
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from utils.__init__ import yaml_load
 import argparse
 import contextlib
 import os
-import platform
 import sys
 from copy import deepcopy
+import platform
 from pathlib import Path
 
 FILE = Path(__file__).resolve()
@@ -21,20 +45,23 @@ if str(ROOT) not in sys.path:
 if platform.system() != 'Windows':
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.common import *  # noqa
-from models.experimental import *  # noqa
+from models.common import *
+#from models.transformer import *
+from models.experimental import *
 from utils.autoanchor import check_anchor_order
-from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
+from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args,yaml_load
 from utils.plots import feature_visualization
-from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
+from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, intersect_dicts,profile, scale_img, select_device,
                                time_sync)
-
+#from utils.tal import dist2bbox, make_anchors
+#from utils.loss import SigmoidBin
 try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
 
 
+## yolov5 head
 class Detect(nn.Module):
     # YOLOv5 Detect head for detection models
     stride = None  # strides computed during build
@@ -78,15 +105,7 @@ class Detect(nn.Module):
 
         return x if self.training else (torch.cat(z, 1), ) if self.export else (torch.cat(z, 1), x)
 
-    def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, '1.10.0')):
-        d = self.anchors[i].device
-        t = self.anchors[i].dtype
-        shape = 1, self.na, ny, nx, 2  # grid shape
-        y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
-        yv, xv = torch.meshgrid(y, x, indexing='ij') if torch_1_10 else torch.meshgrid(y, x)  # torch>=0.7 compatibility
-        grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
-        anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
-        return grid, anchor_grid
+
 class ASFF_Detect(nn.Module):   #add ASFFV5 layer and Rfb 
     stride = None  # strides computed during build
     onnx_dynamic = False  # ONNX export parameter
@@ -151,7 +170,6 @@ class ASFF_Detect(nn.Module):   #add ASFFV5 layer and Rfb
         #print(anchor_grid)
         return grid, anchor_grid
 
-
 class Segment(Detect):
     # YOLOv5 Segment head for segmentation models
     def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True):
@@ -167,6 +185,8 @@ class Segment(Detect):
         p = self.proto(x[0])
         x = self.detect(self, x)
         return (x, p) if self.training else (x[0], p) if self.export else (x[0], p, x[1])
+
+
 
 
 class BaseModel(nn.Module):
@@ -217,12 +237,13 @@ class BaseModel(nn.Module):
         # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment, ASFF_Detect)):
+        if isinstance(m, (Detect, Segment)):
             m.stride = fn(m.stride)
             m.grid = list(map(fn, m.grid))
             if isinstance(m.anchor_grid, list):
                 m.anchor_grid = list(map(fn, m.anchor_grid))
         return self
+
 
 
 class DetectionModel(BaseModel):
@@ -251,7 +272,7 @@ class DetectionModel(BaseModel):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment,ASFF_Detect)):
+        if isinstance(m, (Detect, Segment)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
@@ -326,11 +347,13 @@ class DetectionModel(BaseModel):
 
 Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
 
-
 class SegmentationModel(DetectionModel):
     # YOLOv5 segmentation model
     def __init__(self, cfg='yolov5s-seg.yaml', ch=3, nc=None, anchors=None):
-        super().__init__(cfg, ch, nc, anchors)
+        super().__init__(cfg=cfg, ch=ch, nc=nc, anchors=None)
+    def _forward_augment(self, x):
+        raise NotImplementedError(('WARNING segmentationModel has not supported augment inference yet!!'))
+
 
 
 class ClassificationModel(BaseModel):
@@ -358,7 +381,6 @@ class ClassificationModel(BaseModel):
         # Create a YOLOv5 classification model from a *.yaml file
         self.model = None
 
-
 def parse_model(d, ch):  # model_dict, input_channels(3)
     # Parse a YOLOv5 model.yaml dictionary
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
@@ -379,23 +401,21 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
                 Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x,ECAC3}:
+                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x,ECAC3}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m is Concat_bifpn:
-            c2 = max([ch[x] for x in f])
         # TODO: channel, gw, gd
-        elif m in {Detect, Segment, ASFF_Detect}:
+        elif m in {Detect, Segment}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
@@ -420,7 +440,6 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
@@ -429,18 +448,21 @@ if __name__ == '__main__':
     parser.add_argument('--profile', action='store_true', help='profile model speed')
     parser.add_argument('--line-profile', action='store_true', help='profile model speed layer by layer')
     parser.add_argument('--test', action='store_true', help='test all yolo*.yaml')
+   # parser.add_argument('--kpt', action='store_true', help='test all yolo*.yaml')
     opt = parser.parse_args()
     opt.cfg = check_yaml(opt.cfg)  # check YAML
     print_args(vars(opt))
     device = select_device(opt.device)
-
+    
     # Create model
     im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
-    model = Model(opt.cfg).to(device)
+ #   if opt.kpt:
+       # Model=kP_DetectionModel
+    model = Model(opt.cfg).to(device) 
 
     # Options
     if opt.line_profile:  # profile layer by layer
-        model(im, profile=True)
+        _ = model(im, profile=True)
 
     elif opt.profile:  # profile forward-backward
         results = profile(input=im, ops=[model], n=3)
@@ -451,6 +473,6 @@ if __name__ == '__main__':
                 _ = Model(cfg)
             except Exception as e:
                 print(f'Error in {cfg}: {e}')
-
-    else:  # report fused model summary
+                
+    else :# report fused model summary
         model.fuse()
