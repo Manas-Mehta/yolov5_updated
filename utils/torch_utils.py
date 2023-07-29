@@ -34,6 +34,9 @@ except ImportError:
 warnings.filterwarnings('ignore', message='User provided device_type of \'cuda\', but CUDA is not available. Disabling')
 warnings.filterwarnings('ignore', category=UserWarning)
 
+def intersect_dicts(da, db, exclude=()):
+    # Dictionary intersection of matching keys and shapes, omitting 'exclude' keys, using da values
+    return {k: v for k, v in da.items() if k in db and not any(x in k for x in exclude) and v.shape == db[k].shape}
 
 def smart_inference_mode(torch_1_9=check_version(torch.__version__, '1.9.0')):
     # Applies torch.inference_mode() decorator if torch>=1.9.0 else torch.no_grad() decorator
@@ -41,6 +44,29 @@ def smart_inference_mode(torch_1_9=check_version(torch.__version__, '1.9.0')):
         return (torch.inference_mode if torch_1_9 else torch.no_grad)()(fn)
 
     return decorate
+
+#____________________________________________________________________________________
+def model_info(model, detailed=False, verbose=True, imgsz=640):
+    """Model information. imgsz may be int or list, i.e. imgsz=640 or imgsz=[640, 320]."""
+    if not verbose:
+        return
+    n_p = get_num_params(model)
+    n_g = get_num_gradients(model)  # number gradients
+    if detailed:
+        LOGGER.info(
+            f"{'layer':>5} {'name':>40} {'gradient':>9} {'parameters':>12} {'shape':>20} {'mu':>10} {'sigma':>10}")
+        for i, (name, p) in enumerate(model.named_parameters()):
+            name = name.replace('module_list.', '')
+            LOGGER.info('%5g %40s %9s %12g %20s %10.3g %10.3g %10s' %
+                        (i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std(), p.dtype))
+
+    flops = get_flops(model, imgsz)
+    fused = ' (fused)' if model.is_fused() else ''
+    fs = f', {flops:.1f} GFLOPs' if flops else ''
+
+    name = Path(model.yaml_file).stem.replace('yolo', 'YOLO') if hasattr(model, 'yaml_file') else 'Model'
+    LOGGER.info(f"{name} summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
+    return n_p, flops
 
 
 def smartCrossEntropyLoss(label_smoothing=0.0):
@@ -430,3 +456,4 @@ class ModelEMA:
     def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
         # Update EMA attributes
         copy_attr(self.ema, model, include, exclude)
+
