@@ -6,7 +6,83 @@ utils/initialization
 import contextlib
 import platform
 import threading
+import contextlib
+import inspect
+import logging.config
+import os
+import platform
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import uuid
+import urllib
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Union
 
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+
+
+def yaml_save(file='data.yaml', data=None):
+    """
+    Save YAML data to a file.
+
+    Args:
+        file (str, optional): File name. Default is 'data.yaml'.
+        data (dict, optional): Data to save in YAML format. Default is None.
+
+    Returns:
+        None: Data is saved to the specified file.
+    """
+    file = Path(file)
+    if not file.parent.exists():
+        # Create parent directories if they don't exist
+        file.parent.mkdir(parents=True, exist_ok=True)
+    for k,v in data.items():
+        if isinstance(v,Path):
+                dict[k]=str(v)
+    with open(file, 'w') as f:
+        yaml.safe_dump(data,f, sort_keys=False)
+
+
+def yaml_load(file='data.yaml', append_filename=False):
+    """
+    Load YAML data from a file.
+
+    Args:
+        file (str, optional): File name. Default is 'data.yaml'.
+        append_filename (bool): Add the YAML filename to the YAML dictionary. Default is False.
+
+    Returns:
+        dict: YAML data and file name.
+    """
+    with open(file, errors='ignore', encoding='utf-8') as f:
+        s = f.read()  # string
+        # Remove special characters
+        if not s.isprintable():  # remove special characters
+            s = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\x85\xA0-\uD7FF\uE000-\uFFFD\U00010000-\U0010ffff]+', '', s)
+        #Add YAML filename to dict and return 
+        return {**yaml.safe_load(s), 'yaml_file': str(file)} if append_filename else yaml.safe_load(s)
+
+def yaml_print(yaml_file: Union[str, Path, dict]) -> None:
+    """
+    Pretty prints a yaml file or a yaml-formatted dictionary.
+
+    Args:
+        yaml_file: The file path of the yaml file or a yaml-formatted dictionary.
+
+    Returns:
+        None
+    """
+    yaml_dict = yaml_load(yaml_file) if isinstance(yaml_file, (str, Path)) else yaml_file
+    dump = yaml.dump(yaml_dict, default_flow_style=False)
+    LOGGER.info(f"Printing '{colorstr('bold', 'black', yaml_file)}'\n\n{dump}")
 
 def emojis(str=''):
     # Return platform-dependent emoji-safe version of string
