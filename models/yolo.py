@@ -1,3 +1,4 @@
+
 """YOLOv5-specific modules
 
 Usage:
@@ -5,31 +6,7 @@ Usage:
 """
 
 
-import contextlib
-import platform
-import threading
-import contextlib
-import inspect
-import logging.config
-import os
-import platform
-import re
-import subprocess
-import sys
-import tempfile
-import threading
-import uuid
-import urllib
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Union
 
-import cv2
-import numpy as np
-import pandas as pd
-import torch
-import yaml
-from utils.__init__ import yaml_load
 import argparse
 import contextlib
 import os
@@ -59,7 +36,7 @@ try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
-
+    
 
 ## yolov5 head
 class Detect(nn.Module):
@@ -104,8 +81,16 @@ class Detect(nn.Module):
                 z.append(y.view(bs, self.na * nx * ny, self.no))
 
         return x if self.training else (torch.cat(z, 1), ) if self.export else (torch.cat(z, 1), x)
-
-
+    def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, '1.10.0')):
+        d = self.anchors[i].device
+        t = self.anchors[i].dtype
+        shape = 1, self.na, ny, nx, 2  # grid shape
+        y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
+        yv, xv = torch.meshgrid(y, x, indexing='ij') if torch_1_10 else torch.meshgrid(y, x)  # torch>=0.7 compatibility
+        grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
+        anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
+        return grid, anchor_grid
+        
 class ASFF_Detect(nn.Module):   #add ASFFV5 layer and Rfb 
     stride = None  # strides computed during build
     onnx_dynamic = False  # ONNX export parameter
@@ -188,7 +173,6 @@ class Segment(Detect):
 
 
 
-
 class BaseModel(nn.Module):
     # YOLOv5 base model
     def forward(self, x, profile=False, visualize=False):
@@ -237,7 +221,7 @@ class BaseModel(nn.Module):
         # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
+        if isinstance(m, (Detect, Segment, ASFF_Detect)):
             m.stride = fn(m.stride)
             m.grid = list(map(fn, m.grid))
             if isinstance(m.anchor_grid, list):
@@ -272,7 +256,7 @@ class DetectionModel(BaseModel):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
+        if isinstance(m, (Detect, Segment, ASFF_Detect)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
@@ -344,7 +328,6 @@ class DetectionModel(BaseModel):
             b.data[:, 5:5 + m.nc] += math.log(0.6 / (m.nc - 0.99999)) if cf is None else torch.log(cf / cf.sum())  # cls
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
-
 Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
 
 class SegmentationModel(DetectionModel):
@@ -353,7 +336,6 @@ class SegmentationModel(DetectionModel):
         super().__init__(cfg=cfg, ch=ch, nc=nc, anchors=None)
     def _forward_augment(self, x):
         raise NotImplementedError(('WARNING segmentationModel has not supported augment inference yet!!'))
-
 
 
 class ClassificationModel(BaseModel):
@@ -381,46 +363,86 @@ class ClassificationModel(BaseModel):
         # Create a YOLOv5 classification model from a *.yaml file
         self.model = None
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
-    # Parse a YOLOv5 model.yaml dictionary
-    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
-    anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
+def parse_model(d, ch,verbose=True):  # model_dict, input_channels(3)
+    import ast 
+    nkpt=0
+    no=0
+    anchors_head=True 
+    max_channels = float('inf')
+    if verbose:
+            LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
+    #initial
+    nc, act, scales = (d.get(x) for x in ('nc', 'activation', 'scales'))      
+    gd, gw, kpt_shape = (d.get(x, 1.0) for x in ('depth_multiple', 'width_multiple', 'kpt_shape'))
+   
+    if 'scales' in d.keys():  # guess scale 
+        if scales:
+            scale = d.get('scale')
+            if not scale:
+                scale = tuple(scales.keys())[0]
+                LOGGER.warning(f"WARNING ⚠️ no model scale passed. Assuming scale='{scale}'.")
+            gd, gw, max_channels = scales[scale]   
+    else :             
+        nc, gd, gw,act=  d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
+   
+    # check anchors
+    if 'anchors' in d.keys():
+        anchors=d['anchors']
+        na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
+        no = na * (nc + 5 + 2*nkpt)   # number of outputs = anchors * (classes + 5)
+        
+    else:
+        LOGGER.info('V8_anchor-free!')  
+        no=nc
+        anchors_head=False 
+    if 'nkpt'in d.keys():
+       nkpt=d['nkpt']  
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
-        LOGGER.info(f"{colorstr('activation:')} {act}")  # print
-    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
-
+        if verbose:
+            LOGGER.info(f"{colorstr('activation:')} {act}")  # print
+   
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+        args_dict = {}
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
             with contextlib.suppress(NameError):
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+            
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in {
-                Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
+        if m in {Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, ECAC3}:
+                 
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, ECAC3}:
                 args.insert(2, n)  # number of repeats
                 n = 1
+            if m in {Conv, GhostConv, Bottleneck, GhostBottleneck,DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3, C3TR}:
+                if 'act' in d.keys():
+                    args_dict = {"act" : d['act']}         
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
-            c2 = sum(ch[x] for x in f)
-        # TODO: channel, gw, gd
-        elif m in {Detect, Segment}:
+            c2 = sum([ch[x] for x in f])   
+        elif m is Concat_bifpn:
+            c2 = max([ch[x] for x in f])  
+        elif m in {Detect, Segment, ASFF_Detect}:    
             args.append([ch[x] for x in f])
-            if isinstance(args[1], int):  # number of anchors
-                args[1] = [list(range(args[1] * 2))] * len(f)
+            if isinstance(args[1], int) and anchors_head:  # number of anchors
+                args[1] = [list(range(args[1] * 2))] * len(f)   
+         
             if m is Segment:
-                args[3] = make_divisible(args[3] * gw, 8)
+                if not anchors_head:
+                    args[2]=make_divisible(args[2] * gw, 8)
+                else:
+                    args[3] = make_divisible(args[3] * gw, 8)   
+                   
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
@@ -428,17 +450,20 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        
+        m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace('__main__.', '')  # module type
-        np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
+        m_.np = sum(x.numel() for x in m_.parameters())  # number params
+        m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type, number params
+        if verbose:
+            LOGGER.info(f'{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}')  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
+    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
